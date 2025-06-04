@@ -5597,6 +5597,7 @@ class NonVisualModel(ActionPredict):
         self.seq_type = 'nonvisual'
         self.input_type_list = input_type_list
         self.max_seq_len = max_seq_len
+        self.aux_preds = {}  # 记录每个 modality 的 CLS token 辅助预测
 
         # Learnable positional encoding
         #self.position_layer = LearnablePositionEncoding(self.max_seq_len + 1, self.hidden_dim)     #可学习
@@ -5612,7 +5613,7 @@ class NonVisualModel(ActionPredict):
 
         behavior_keys = ['action', 'look',  'hand_gesture', 'motion_direction']
         scene_keys = ['num_lanes', 'intersection', 'ped_crossing', 'traffic_light',
-                      'traffic_direction', 'road_type', 'stop_sign', 'ped_sign',
+                      'traffic_direction', 'stop_sign', 'ped_sign',
                       'signalized', 'has_sign', 'sign', 'group_size', 'construction_sign','scene_density']
         # 实际收到字段打印
         print("📦 实际 data 中的字段：", list(data.keys()))
@@ -5705,6 +5706,7 @@ class NonVisualModel(ActionPredict):
             x = layer_input[t]
 
             x = Dense(self.hidden_dim)(x)
+            x = Dropout(self.dropout_rate)(x)
 
             # 第一层拼接 learnable CLS token
             x = tf.concat([cls_tokens_dict[t], x], axis=1)  # [B, 17, D]
@@ -5743,7 +5745,7 @@ class NonVisualModel(ActionPredict):
                 x = tf.concat([cmsa_cls, branch_token], axis=1)  # 拼接形成新的 17 帧
                 x_res = x
 
-                x = Dense(self.hidden_dim * 2, activation='relu')(x)
+                x = Dense(self.hidden_dim * 4, activation='relu')(x)
                 x = Dense(self.hidden_dim)(x)
                 x = Dropout(self.dropout_rate)(x)
                 x = LayerNormalization()(x + x_res)
@@ -5752,13 +5754,23 @@ class NonVisualModel(ActionPredict):
 
             layer_input = new_layer_input  # 为下一层准备输入（包含已更新的 17 帧）
 
+        # 添加辅助 loss 输出，每个支路的最终 CLS token → 1 维 sigmoid
+        for t in data_types:
+            final_branch_x = layer_input[t]  # [B, 17, D]
+            cls_vector = final_branch_x[:, 0, :]  # 只取 CLS 位
+            self.aux_preds[t] = Dense(1, activation='sigmoid', name=f'aux_{t}')(cls_vector)
+
         # 最后输出黄 CLS → MLP 分类
         final_cls = yellow_cls[:, 0, :]  # shape [B, D]
         out = Dense(self.hidden_dim, activation='relu')(final_cls)
         out = Dropout(0.2)(out)
-        out = Dense(1, activation='sigmoid')(out)
+        #out = Dense(1, activation='sigmoid')(out)
+        out = Dense(1, activation='sigmoid', name='main_output')(out)
+        outputs = [out] + list(self.aux_preds.values())
 
-        return Model(inputs=inputs, outputs=out)
+        #return Model(inputs=inputs, outputs=out)
+        return Model(inputs=inputs, outputs=outputs)
+
 
     def train(self, data_train,
               data_val,
@@ -5804,11 +5816,46 @@ class NonVisualModel(ActionPredict):
         # Train the model
         class_w = self.class_weights(model_opts['apply_class_weights'], data_train['count'])
         optimizer = self.get_optimizer(optimizer)(lr=lr)
-        train_model.compile(loss='binary_crossentropy', optimizer=optimizer, metrics=['accuracy'])
+
+        #train_model.compile(loss='binary_crossentropy', optimizer=optimizer, metrics=['accuracy']) #基础
+        from tensorflow.keras.losses import BinaryCrossentropy      #必要输入
+
+        loss_fn = BinaryCrossentropy(label_smoothing=0.1)
+
+        """
+        losses = [loss_fn] * (1 + len(self.aux_preds))    #辅助loss1
+        loss_weights = [1.0] + [0.3] * len(self.aux_preds)#辅助loss1
+        
+        losses = {                                        #辅助loss2
+            'main_output': BinaryCrossentropy(label_smoothing=0.1),
+            'aux_behavior': BinaryCrossentropy(),
+            'aux_bbox': BinaryCrossentropy(),
+            'aux_vehicle': BinaryCrossentropy(),
+            'aux_scene': BinaryCrossentropy()
+        }
+
+        loss_weights = {                                #辅助loss2
+            'main_output': 1.0,
+            'aux_behavior': 0.3,  # 🔥 提高行为分支影响力
+            'aux_bbox': 0.3,
+            'aux_vehicle': 0.3,
+            'aux_scene': 0.3
+        }
+       
+        """
+        #train_model.compile(loss=loss_fn, optimizer=optimizer, metrics=['accuracy']) #基础
+        train_model.compile(
+            loss=loss_fn,
+            #loss=losses,                               #辅助loss1,2
+            #loss_weights=loss_weights,                 #辅助loss1,2
+            optimizer=optimizer,
+            metrics=['accuracy']
+        )
 
         # Custom model saving callback for epochs 50, 60, 70, 80
         def save_model_on_epochs(epoch, logs):
-            if epoch in [ 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+            if epoch in [   10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                            20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
                             41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
                             51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
                             61, 62, 63, 64, 65, 66, 67, 68, 69, 70,
@@ -5838,20 +5885,38 @@ class NonVisualModel(ActionPredict):
         save_model_callback = LambdaCallback(on_epoch_end=save_model_on_epochs)
 
         # Use ModelCheckpoint for saving the best model during training
+
+        # 获取 callback 列表
         callbacks = self.get_callbacks(learning_scheduler, model_path)
         if callbacks is None:
             callbacks = []
+
+        # 添加保存当前 epoch 的模型（你原来的）
         callbacks.append(save_model_callback)
 
-        # Train the model
-        history = train_model.fit(x=data_train['data'][0],
-                                  y=None if self._generator else data_train['data'][1],
-                                  batch_size=None,
-                                  epochs=epochs,
-                                  validation_data=data_val,
-                                  class_weight=class_w,
-                                  verbose=1,
-                                  callbacks=callbacks)
+        # ✅ 添加保存 val acc 最佳模型的 callback
+        best_model_path = os.path.join(model_path.rsplit('/', 1)[0], 'best_model.h5')
+        checkpoint_callback = ModelCheckpoint(
+            filepath=best_model_path,
+            monitor='val_main_output_accuracy',  # 如果你 metrics 是 'val_accuracy' 就写那个
+            save_best_only=True,
+            save_weights_only=False,
+            verbose=1,
+            mode='max'
+        )
+        callbacks.append(checkpoint_callback)
+
+        # ✅ 正式开始训练
+        history = train_model.fit(
+            x=data_train['data'][0],
+            y=None if self._generator else data_train['data'][1],
+            batch_size=None,
+            epochs=epochs,
+            validation_data=data_val,
+            class_weight=class_w,
+            verbose=2,#原来是1
+            callbacks=callbacks
+        )
 
         if 'checkpoint' not in learning_scheduler:
             print('Train model is saved to {}'.format(model_path))
@@ -5873,7 +5938,8 @@ class NonVisualModel(ActionPredict):
 
         return saved_files_path
 
-    def test(self, data_test, model_path=''):
+    #def test(self, data_test, model_path=''):
+    def test(self, data_test, model_path='', model_file='model.h5'):#测试所有model 1共2
         """
         Evaluates a given model — 使用自定义层加载 .h5 并进行测试
         """
@@ -5882,12 +5948,21 @@ class NonVisualModel(ActionPredict):
 
         # ✅ 替换为你的自定义层
         test_model = load_model(
-            os.path.join(model_path, 'model.h5'),
+            #os.path.join(model_path, 'model.h5'),
+            os.path.join(model_path, model_file),#测试所有model 2共2
             custom_objects={
                 'LearnableCLSTokens': LearnableCLSTokens,
                 'SinusoidalPositionEncoding': SinusoidalPositionEncoding
             }
         )
+
+        # ✅ 添加：仅保留主输出（main_output）
+        if isinstance(test_model.output, list):
+            test_model = tf.keras.Model(
+                inputs=test_model.input,
+                outputs=test_model.get_layer('main_output').output
+            )
+
         test_model.summary()
 
         test_data = self.get_data('test', data_test, {**opts['model_opts'], 'batch_size': 1})
@@ -5925,6 +6000,7 @@ class NonVisualModel(ActionPredict):
                 yaml.dump(results, fid)
 
         return acc, auc, f1, precision, recall
+
 
 
 def action_prediction(model_name):
